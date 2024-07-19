@@ -96,7 +96,8 @@ pub const Request = struct {
             T,
             self.allocator,
             &reader,
-            .{ .ignore_unknown_fields = true },
+            // @TODO: make max_value_len configurable
+            .{ .ignore_unknown_fields = true, .max_value_len = 20 * 1024 * 1024 },
         );
     }
 
