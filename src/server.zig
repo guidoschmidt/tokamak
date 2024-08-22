@@ -172,8 +172,9 @@ pub const Server = struct {
             std.debug.panic("accept: {}", .{e});
         };
 
+        // @TODO make this configurable
         const timeout = std.posix.timeval{
-            .tv_sec = @as(i32, 5),
+            .tv_sec = @as(i32, 20),
             .tv_usec = @as(i32, 0),
         };
 
