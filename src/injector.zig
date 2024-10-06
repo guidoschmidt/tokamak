@@ -1,126 +1,122 @@
 const std = @import("std");
+const meta = @import("meta.zig");
+const t = std.testing;
 
-/// Hierarchical, stack-based dependency injection context implemented as a
-/// fixed-size array of (TypeId, *anyopaque) pairs.
+/// Injector serves as a custom runtime scope for retrieving dependencies.
+/// It can be passed around, enabling any code to request a value or reference
+/// to a given type. Additionally, it can invoke arbitrary functions and supply
+/// the necessary dependencies automatically.
 ///
-/// The stack structure is well-suited for middleware-based applications, as it
-/// allows for easy addition and removal of dependencies whenever the scope
-/// starts or ends.
-///
-/// When a dependency is requested, the context is searched from top to bottom.
-/// If the dependency is not found, the parent context is searched. If the
-/// dependency is still not found, an error is returned.
+/// Injectors can be nested. If a dependency is not found, the parent context
+/// is searched. If the dependency is still not found, an error is returned.
 pub const Injector = struct {
-    registry: std.BoundedArray(struct { TypeId, *anyopaque }, 32) = .{},
+    ctx: *anyopaque,
+    resolver: *const fn (*anyopaque, meta.TypeId) ?*anyopaque,
     parent: ?*const Injector = null,
 
-    /// Create a new injector from a tuple of pointers.
-    pub fn from(refs: anytype) !Injector {
-        const T = @TypeOf(refs);
+    pub const empty: Injector = .{ .ctx = undefined, .resolver = resolveNull };
 
-        comptime if (@typeInfo(T) != .Struct or !@typeInfo(T).Struct.is_tuple) {
-            @compileError("Expected tuple of pointers");
-        };
-
-        var res = Injector{};
-
-        inline for (std.meta.fields(T)) |f| {
-            try res.push(@field(refs, f.name));
+    /// Create a new injector from a context ptr and an optional parent.
+    pub fn init(ctx: anytype, parent: ?*const Injector) Injector {
+        if (comptime !meta.isOnePtr(@TypeOf(ctx))) {
+            @compileError("Expected pointer to a context, got " ++ @typeName(@TypeOf(ctx)));
         }
 
-        return res;
-    }
+        const H = struct {
+            fn resolve(ptr: *anyopaque, tid: meta.TypeId) ?*anyopaque {
+                var cx: @TypeOf(ctx) = @constCast(@ptrCast(@alignCast(ptr)));
 
-    /// Create a new injector from a parent context and a tuple of pointers.
-    pub fn fromParent(parent: *const Injector, refs: anytype) !Injector {
-        var res = try Injector.from(refs);
-        res.parent = parent;
-        return res;
-    }
+                inline for (std.meta.fields(@TypeOf(cx.*))) |f| {
+                    const p = if (comptime meta.isOnePtr(f.type)) @field(cx, f.name) else &@field(cx, f.name);
 
-    /// Add a dependency to the context.
-    pub fn push(self: *Injector, ref: anytype) !void {
-        const T = @TypeOf(ref);
+                    if (tid == meta.tid(@TypeOf(p))) {
+                        std.debug.assert(@intFromPtr(p) != 0xaaaaaaaaaaaaaaaa);
+                        return @ptrCast(@constCast(p));
+                    }
+                }
 
-        comptime if (@typeInfo(T) != .Pointer) {
-            @compileError("Expected a pointer");
+                if (tid == meta.tid(@TypeOf(cx))) {
+                    return ptr;
+                }
+
+                return null;
+            }
         };
 
-        // This should be safe because we always check TypeId first.
-        try self.registry.append(.{ TypeId.from(T), @constCast(ref) });
+        return .{
+            .ctx = @constCast(@ptrCast(ctx)), // resolver() casts back first, so this should be safe
+            .resolver = &H.resolve,
+            .parent = parent,
+        };
     }
 
-    /// Remove the last dependency from the context.
-    pub fn pop(self: *Injector) void {
-        _ = self.registry.pop();
-    }
-
-    /// Get a dependency from the context.
-    pub fn get(self: *const Injector, comptime T: type) !T {
-        if (comptime T == *const Injector) return self;
-
-        if (comptime @typeInfo(T) != .Pointer) {
-            return (try self.get(*const T)).*;
+    pub fn find(self: Injector, comptime T: type) ?T {
+        if (comptime T == Injector) {
+            return self;
         }
 
-        for (self.registry.constSlice()) |node| {
-            if (TypeId.from(T).id == node[0].id) {
-                return @ptrCast(@alignCast(node[1]));
+        if (comptime !meta.isOnePtr(T)) {
+            return if (self.find(*const T)) |p| p.* else null;
+        }
+
+        if (self.resolver(self.ctx, meta.tid(T))) |ptr| {
+            return @ptrCast(@constCast(@alignCast(ptr)));
+        }
+
+        if (comptime @typeInfo(T).pointer.is_const) {
+            if (self.resolver(self.ctx, meta.tid(*@typeInfo(T).pointer.child))) |ptr| {
+                return @ptrCast(@constCast(@alignCast(ptr)));
             }
         }
 
-        if (self.parent) |parent| {
-            return parent.get(T);
-        } else {
+        return if (self.parent) |p| p.find(T) else null;
+    }
+
+    /// Get a dependency from the context.
+    pub fn get(self: Injector, comptime T: type) !T {
+        return self.find(T) orelse {
             std.log.debug("Missing dependency: {s}", .{@typeName(T)});
             return error.MissingDependency;
-        }
+        };
+    }
+
+    test get {
+        var num: u32 = 123;
+        var cx = .{ .num = &num };
+        const inj = Injector.init(&cx, null);
+
+        try t.expectEqual(inj, inj.get(Injector));
+        try t.expectEqual(&num, inj.get(*u32));
+        try t.expectEqual(@as(*const u32, &num), inj.get(*const u32));
+        try t.expectEqual(123, inj.get(u32));
+        try t.expectEqual(error.MissingDependency, inj.get(u64));
     }
 
     /// Call a function with dependencies. The `extra_args` tuple is used to
-    /// pass additional arguments to the function.
-    pub fn call(self: *const Injector, comptime fun: anytype, extra_args: anytype) CallRes(@TypeOf(fun)) {
-        if (@typeInfo(@TypeOf(extra_args)) != .Struct) @compileError("Expected a tuple of arguments");
-
-        var args: std.meta.ArgsTuple(@TypeOf(fun)) = undefined;
-        const extra_start = args.len - extra_args.len;
-
-        inline for (0..extra_start) |i| {
-            args[i] = try self.get(@TypeOf(args[i]));
+    /// pass additional arguments to the function. Function with anytype can
+    /// be called as long as the concrete value is provided in the `extra_args`.
+    pub fn call(self: Injector, comptime fun: anytype, extra_args: anytype) anyerror!meta.Result(fun) {
+        if (comptime @typeInfo(@TypeOf(extra_args)) != .@"struct") {
+            @compileError("Expected a tuple of arguments");
         }
 
-        inline for (extra_start..args.len, 0..) |i, j| {
-            args[i] = extra_args[j];
-        }
+        const params = @typeInfo(@TypeOf(fun)).@"fn".params;
+        const extra_start = params.len - extra_args.len;
+
+        const types = comptime brk: {
+            var types: [params.len]type = undefined;
+            for (0..extra_start) |i| types[i] = params[i].type orelse @compileError("reached anytype");
+            for (extra_start..params.len, 0..) |i, j| types[i] = @TypeOf(extra_args[j]);
+            break :brk &types;
+        };
+
+        var args: std.meta.Tuple(types) = undefined;
+        inline for (0..args.len) |i| args[i] = if (i < extra_start) try self.get(@TypeOf(args[i])) else extra_args[i - extra_start];
 
         return @call(.auto, fun, args);
     }
-
-    // TODO: This is a hack which allows embedding ServerOptions in the
-    //       configuration file but maybe there's a better way...
-    pub fn jsonParse(_: std.mem.Allocator, _: anytype, _: std.json.ParseOptions) !Injector {
-        return .{};
-    }
 };
 
-const TypeId = struct {
-    id: [*:0]const u8,
-
-    fn from(comptime T: type) TypeId {
-        return .{ .id = @typeName(T) };
-    }
-};
-
-fn CallRes(comptime F: type) type {
-    switch (@typeInfo(F)) {
-        .Fn => |f| {
-            const R = f.return_type orelse @compileError("Invalid function");
-
-            return switch (@typeInfo(R)) {
-                .ErrorUnion => |e| return anyerror!e.payload,
-                else => anyerror!R,
-            };
-        },
-        else => @compileError("Expected a function, got " ++ @typeName(@TypeOf(F))),
-    }
+fn resolveNull(_: *anyopaque, _: meta.TypeId) ?*anyopaque {
+    return null;
 }
