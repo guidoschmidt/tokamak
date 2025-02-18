@@ -10,7 +10,7 @@ pub const Route = struct {
     method: ?httpz.Method = null,
     prefix: ?[]const u8 = null,
     path: ?[]const u8 = null,
-    handler: ?*const Handler = null,
+    handler: ?*const fn (*Context) anyerror!void = null, // TODO: should be `?*const Handler` but Zig recently reverted again
     children: []const Route = &.{},
     metadata: ?*const Metadata = null,
 
@@ -37,6 +37,25 @@ pub const Route = struct {
         }
 
         return Params{};
+    }
+
+    /// Provides a dependency to the children routes by calling the given
+    /// factory. If there is a `deinit` method, it will be called at the end of
+    /// the scope.
+    pub fn provide(comptime fac: anytype, children: []const Route) Route {
+        const H = struct {
+            fn handleProvide(ctx: *Context) anyerror!void {
+                var child = .{try ctx.injector.call(fac, .{})};
+                defer if (comptime std.meta.hasMethod(@TypeOf(child[0]), "deinit")) child[0].deinit();
+
+                try ctx.nextScoped(&child);
+            }
+        };
+
+        return .{
+            .handler = H.handleProvide,
+            .children = children,
+        };
     }
 
     /// Returns a route that sends the given, comptime response.
@@ -155,6 +174,10 @@ pub const Route = struct {
 };
 
 fn route(comptime method: httpz.Method, comptime path: []const u8, comptime has_body: bool, comptime handler: anytype) Route {
+    if (comptime path.len == 0 or path[0] != '/') {
+        @compileError("Path must start with a slash");
+    }
+
     // Special case for putting catch-all routes behind a path.
     if (comptime @TypeOf(handler) == Route) {
         if (handler.metadata) |m| {

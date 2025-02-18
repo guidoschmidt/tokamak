@@ -24,7 +24,7 @@ pub fn dupe(allocator: std.mem.Allocator, value: anytype) !@TypeOf(value) {
             return res;
         },
         .pointer => |p| switch (p.size) {
-            .Slice => if (p.child == u8) allocator.dupe(p.child, value) else error.NotSupported,
+            .slice => if (p.child == u8) allocator.dupe(p.child, value) else error.NotSupported,
             else => value,
         },
         else => value,
@@ -53,7 +53,17 @@ pub fn isGeneric(comptime fun: anytype) bool {
 
 pub fn isOnePtr(comptime T: type) bool {
     return switch (@typeInfo(T)) {
-        .pointer => |p| p.size == .One,
+        .pointer => |p| p.size == .one,
+        else => false,
+    };
+}
+
+pub fn isString(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .pointer => |ptr| ptr.child == u8 or switch (@typeInfo(ptr.child)) {
+            .array => |arr| arr.child == u8,
+            else => false,
+        },
         else => false,
     };
 }

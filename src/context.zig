@@ -39,7 +39,7 @@ pub const Context = struct {
         inline for (std.meta.fields(T)) |f| {
             if (query.get(f.name)) |param| {
                 @field(res, f.name) = try parse(f.type, param);
-            } else if (f.default_value) |ptr| {
+            } else if (f.default_value_ptr) |ptr| {
                 @field(res, f.name) = @as(*const f.type, @ptrCast(@alignCast(ptr))).*;
             } else {
                 return error.MissingField;
@@ -138,7 +138,6 @@ pub const Context = struct {
         }
     }
 
-    // TODO: remove this
     pub fn nextScoped(self: *Context, ctx: anytype) !void {
         const prev = self.injector;
         defer self.injector = prev;
